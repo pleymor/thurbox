@@ -77,6 +77,10 @@ impl TmuxCompatible for Psmux {
     /// target kills `%8`. A thurbox window holds one pane, so that is its
     /// window gone.
     const KILL_BY_PANE: bool = true;
+
+    /// psmux 3.3.8 reports a target it cannot resolve on stderr and exits 0,
+    /// and 3.3.7 was measured writing nothing to stderr on success.
+    const ERRORS_ON_STDERR: bool = true;
     const PANE_MONITORING: bool = true;
 
     /// Nothing has verified that a psmux reply queues behind the pane output

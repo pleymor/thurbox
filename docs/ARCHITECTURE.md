@@ -998,6 +998,15 @@ reference to read before touching that path.
   `rename-window`, `set-option -w` and `kill-pane`. 3.3.8 refuses an ambiguous
   bare `%N` (#569) and documents the pane-slot form. tmux ids are server-wide
   and its targets are unchanged.
+- **There is no exact-name target, and a refusal can exit 0.** psmux 3.3.7
+  refuses `thurbox:=tb-x` ("can't find window") even when `tb-x` is the only
+  window of that name. `display-message` and `capture-pane` print that refusal
+  on stdout and exit 0, and 3.3.8 prints it on stderr and exits 0. So where the
+  listing finds several unstamped namesakes, psmux's `settle` resolves a pane
+  id from `list-panes` (`pane_named`): the remembered pane if it is one of
+  them, the only pane under the name if there is one, and `Unknown`
+  otherwise. It never answers with a name target. On psmux, any stderr also
+  fails a one-shot command (`TmuxCompatible::ERRORS_ON_STDERR`).
 - **`kill-window` misreads a pane id in the pane slot.** On 3.3.7,
   `kill-window -t thurbox:.%8` killed the session's *active* window, not `%8`'s
   (fixed in 3.3.8, dc183e3). `kill-pane` with the same target kills `%8`, and a

@@ -70,6 +70,11 @@ pub trait TmuxCompatible: Send + Sync + 'static {
     /// the pane slot. Only right where a thurbox window holds one pane.
     const KILL_BY_PANE: bool = false;
 
+    /// Whether a one-shot command that wrote to stderr failed, whatever its
+    /// exit status: for a server that reports a refused target there and
+    /// still exits 0.
+    const ERRORS_ON_STDERR: bool = false;
+
     /// Whether pane output must be enabled and disabled with `refresh-client
     /// -A`. Servers that stream attached panes automatically do not take it.
     const PANE_MONITORING: bool;
@@ -301,17 +306,6 @@ fn parse_discovered(line: &str, stamps: bool) -> Option<DiscoveredSession> {
         },
         role: WindowRole::parse(role).unwrap_or(by_name),
     })
-}
-
-/// Build the `session:=window` tmux target for a thurbox agent session.
-///
-/// The `=` prefix forces tmux to match the window name exactly. Without
-/// it tmux falls back to FNMATCH-style prefix matching, so a target of
-/// `tb-foo` would resolve ambiguously when both `tb-foo` and
-/// `tb-foo-bar` exist — `send-keys`/`capture-pane` then fails with
-/// "ambiguous window" and the caller's text is silently dropped.
-fn window_target(window_name: &str) -> String {
-    format!("{TMUX_SESSION}:={window_name}")
 }
 
 /// `target` as `-t` should carry it on a server whose ids are numbered per
@@ -799,6 +793,11 @@ impl<M: TmuxCompatible> Server<M> {
         (verb, self.target(id))
     }
 
+    /// Whether a one-shot command's `output` is a failure on this server.
+    fn failed(&self, output: &std::process::Output) -> bool {
+        mux_failed(output.status.success(), &output.stderr, M::ERRORS_ON_STDERR)
+    }
+
     /// Refuse a status verb on a server whose hooks have no channel
     /// ([`TmuxCompatible::HOOK_STATUS`]).
     fn refuse_without_hook_status(&self) -> Result<()> {
@@ -998,8 +997,9 @@ impl<M: TmuxCompatible> Server<M> {
     /// What `owner`'s `role` window is, where the listing alone could not say.
     ///
     /// A multiplexer without window options (ADR-13) stamps nothing, so
-    /// two namesakes are indistinguishable there and the name is the answer —
-    /// on a host, only through the pane the row remembers. Locally, one stamp
+    /// two namesakes are indistinguishable there: the answer is the pane the
+    /// row remembers when it is still one of them, the only pane under the
+    /// name when there is one, and unknown otherwise ([`pane_named`]). Locally, one stamp
     /// on two windows is repairable, and here is where repairing it matters:
     /// `stamped_match` refuses the pair by design, so without this nothing
     /// would ever look again and the session stayed unaddressable for good
@@ -1012,17 +1012,11 @@ impl<M: TmuxCompatible> Server<M> {
             _ => owner.agent_pane,
         };
         if !M::WINDOW_OPTIONS {
-            let name = window_name_for(role, owner.name);
-            if !self.transport.is_remote() {
-                return Ok(Located::At(window_target(&name)));
-            }
-            if remembered.is_empty() {
-                return Ok(Located::Unknown);
-            }
-            // The remembered pane's own window, asked for by pane: a window
-            // lists its *selected* pane, which after a split need not be the
-            // one the row remembers. A server that restarted reissues ids, so
-            // one now in a window of another name is not this row's.
+            // Answered by pane id from the session's panes, never by a
+            // `thurbox:=name` target: psmux 3.3.7 refuses that form even for a
+            // unique name, and prints the refusal on stdout with status 0.
+            // Panes rather than windows, because a window lists its *selected*
+            // pane, which after a split need not be the one the row remembers.
             let panes = self.tmux_output(&[
                 "list-panes",
                 "-s",
@@ -1031,12 +1025,11 @@ impl<M: TmuxCompatible> Server<M> {
                 "-F",
                 "#{pane_id}|#{window_name}",
             ])?;
-            return Ok(
-                match window_of_pane(&panes, remembered) == Some(name.as_str()) {
-                    true => Located::At(remembered.to_string()),
-                    false => Located::Unknown,
-                },
-            );
+            return Ok(pane_named(
+                &panes,
+                &window_name_for(role, owner.name),
+                remembered,
+            ));
         }
         if self.transport.is_remote()
             || self
@@ -1072,7 +1065,7 @@ impl<M: TmuxCompatible> Server<M> {
                 self.transport
                     .launch_failure("Failed to run tmux command", e)
             })?;
-        if !output.status.success() {
+        if self.failed(&output) {
             bail!("{} {what} {}", self.transport.mux(), mux_failure(&output));
         }
         Ok(output)
@@ -1134,7 +1127,7 @@ impl<M: TmuxCompatible> Server<M> {
                     .launch_failure("Failed to run tmux command", e)
             })?;
 
-        if !output.status.success() {
+        if self.failed(&output) {
             let stderr = String::from_utf8_lossy(&output.stderr);
             bail!("tmux {} failed: {}", args.join(" "), stderr.trim());
         }
@@ -3754,7 +3747,7 @@ impl<M: TmuxCompatible> Server<M> {
             .tmux_command(&self.socket(), &[verb, "-t", &target])
             .output()
             .context("Failed to run tmux kill-window")?;
-        if !output.status.success() {
+        if self.failed(&output) {
             let stderr = String::from_utf8_lossy(&output.stderr);
             if already_gone(&stderr) {
                 return Ok(());
@@ -3958,14 +3951,35 @@ fn path_prefix_args() -> Vec<std::ffi::OsString> {
     Vec::new()
 }
 
-/// The name of the window `pane` is in, from a `list-panes -F
-/// '#{pane_id}|#{window_name}'` answer.
-fn window_of_pane<'a>(listing: &'a str, pane: &str) -> Option<&'a str> {
-    listing
+/// Where a `list-panes -F '#{pane_id}|#{window_name}'` answer puts the window
+/// named `name`: the `remembered` pane when it is one of that name's, the one
+/// pane under the name when there is exactly one, and otherwise
+/// [`Located::Unknown`]. A server that restarted reissues ids, so a remembered
+/// pane now in a window of another name is not this row's. Never
+/// [`Located::Absent`]: this is asked because a listing found several
+/// namesakes, and reading a later empty answer as absence would relaunch a
+/// session that may be running.
+fn pane_named(listing: &str, name: &str, remembered: &str) -> Located {
+    let panes: Vec<&str> = listing
         .lines()
         .filter_map(|line| line.split_once('|'))
-        .find(|(id, _)| *id == pane)
-        .map(|(_, window)| window)
+        .filter(|(_, window)| *window == name)
+        .map(|(pane, _)| pane)
+        .collect();
+    if !remembered.is_empty() && panes.contains(&remembered) {
+        return Located::At(remembered.to_string());
+    }
+    match panes.as_slice() {
+        [only] => Located::At(only.to_string()),
+        _ => Located::Unknown,
+    }
+}
+
+/// Whether a one-shot command failed: by its status, or by writing to stderr
+/// where the adapter says that is how a refusal shows
+/// ([`TmuxCompatible::ERRORS_ON_STDERR`]).
+fn mux_failed(success: bool, stderr: &[u8], errors_on_stderr: bool) -> bool {
+    !success || (errors_on_stderr && !String::from_utf8_lossy(stderr).trim().is_empty())
 }
 
 /// Whether a kill's failure says its target is already gone — named by its
@@ -4937,10 +4951,53 @@ mod tests {
     #[test]
     fn a_pane_is_placed_in_the_window_it_is_in() {
         let listing = "%3|tb-mine\n%5|tb-mine\n%4|tb-theirs\n";
-        assert_eq!(window_of_pane(listing, "%5"), Some("tb-mine"));
-        assert_eq!(window_of_pane(listing, "%4"), Some("tb-theirs"));
-        assert_eq!(window_of_pane(listing, "%9"), None);
-        assert_eq!(window_of_pane(listing, ""), None);
+        assert_eq!(
+            pane_named(listing, "tb-mine", "%5"),
+            Located::At("%5".into())
+        );
+        assert_eq!(
+            pane_named(listing, "tb-theirs", "%4"),
+            Located::At("%4".into())
+        );
+        assert_eq!(pane_named(listing, "tb-mine", "%4"), Located::Unknown);
+    }
+
+    /// The recovery path that failed: two windows of one name, and a row that
+    /// remembers no pane or one that is gone. The answer is "unknown", never a
+    /// `=name` target — psmux 3.3.7 refuses those even for a unique name, with
+    /// the error on stdout and status 0.
+    #[test]
+    fn namesakes_with_no_live_remembered_pane_are_unknown() {
+        let listing = "%1|tb-a\n%2|tb-dup\n%3|tb-dup\n";
+        assert_eq!(pane_named(listing, "tb-dup", ""), Located::Unknown);
+        assert_eq!(pane_named(listing, "tb-dup", "%9"), Located::Unknown);
+        assert_eq!(pane_named(listing, "tb-dup", "%1"), Located::Unknown);
+        assert_eq!(pane_named(listing, "tb-gone", ""), Located::Unknown);
+    }
+
+    /// One pane under the name is that pane, by its id, whatever the row
+    /// remembers.
+    #[test]
+    fn a_unique_pane_under_the_name_is_its_id() {
+        let listing = "%1|tb-a\n%2|tb-one\n";
+        assert_eq!(pane_named(listing, "tb-one", ""), Located::At("%2".into()));
+        assert_eq!(
+            pane_named(listing, "tb-one", "%7"),
+            Located::At("%2".into())
+        );
+    }
+
+    /// psmux 3.3.8 reports a refused target on stderr with status 0, so where an
+    /// adapter says stderr is an error, any stderr fails the command; elsewhere
+    /// only the status does.
+    #[test]
+    fn stderr_fails_a_command_only_where_the_adapter_says_so() {
+        let refused = b"psmux: can't find window: =tb-dup\n".as_slice();
+        assert!(mux_failed(true, refused, true));
+        assert!(!mux_failed(true, b"  \n", true));
+        assert!(!mux_failed(true, refused, false));
+        assert!(mux_failed(false, b"", false));
+        assert!(mux_failed(false, b"", true));
     }
 
     // Compile-time check: channel capacity must be large enough to buffer heavy output.
@@ -5292,17 +5349,6 @@ mod tests {
             parse_discovered(&format!("%5|tbs-fleet|0|{ONE}|agent"), false).expect("parsed");
         assert_eq!(shell.role, WindowRole::Shell);
         assert_eq!(shell.session, "");
-    }
-
-    #[test]
-    fn window_target_uses_exact_match_prefix() {
-        // Without `=`, tmux treats the window name as a pattern and will
-        // resolve `tb-foo` ambiguously when both `tb-foo` and
-        // `tb-foo-bar` exist. The `=` prefix forces exact-match lookup.
-        let t = window_target(&agent_window_name("foo"));
-        assert!(t.ends_with(":=tb-foo"), "got {t}");
-        let shell = window_target(&shell_window_name("foo"));
-        assert!(shell.ends_with(":=tbs-foo"), "got {shell}");
     }
 
     #[test]
