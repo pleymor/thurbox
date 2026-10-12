@@ -447,6 +447,12 @@ fn psmux_window_powershell(
     for (k, v) in pairs {
         ps.push_str(&format!("Set-Item Env:{k} {}; ", powershell_quote(v)));
     }
+    if let Some(dir) = cli_directory() {
+        ps.push_str(&format!(
+            "Set-Item Env:PATH ({} + (Get-Item Env:PATH).Value); ",
+            powershell_quote(&format!("{dir};"))
+        ));
+    }
     ps.push_str(&format!("& {}", powershell_quote(command)));
     for a in args {
         ps.push(' ');
@@ -457,6 +463,25 @@ fn psmux_window_powershell(
         ps.push_str(EXIT_REPORT);
     }
     ps
+}
+
+/// The directory of this build's `thurbox-cli`, put first on a window's PATH.
+///
+/// psmux rebuilds a pane's `PATH` from the registry instead of inheriting the
+/// server's, so a second install beside the one on the user's PATH would have
+/// its windows (exit report, hooks, heartbeat) call the other install's CLI.
+/// This is the Windows counterpart of the tmux adapters' `path_prefix_args`.
+/// Off in unit tests, which compare exact window commands.
+#[cfg(not(test))]
+fn cli_directory() -> Option<String> {
+    let cli = crate::paths::resolve_cli_binary();
+    let dir = cli.parent().filter(|d| !d.as_os_str().is_empty())?;
+    dir.to_str().map(str::to_string)
+}
+
+#[cfg(test)]
+fn cli_directory() -> Option<String> {
+    None
 }
 
 /// [`psmux_window_powershell`] framed as one
